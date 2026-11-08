@@ -1,0 +1,117 @@
+name: Kali1 Developer Studio
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  kali1:
+    # GitHub-hosted runner is temporary (not a persistent cloud VM)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Install desktop and developer prerequisites
+        shell: bash
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            xfce4 xfce4-goodies dbus-x11 xrdp \
+            openssh-server curl wget git unzip zip \
+            python3 python3-pip python3-venv \
+            build-essential clang lldb lld llvm cmake ninja-build pkg-config \
+            openjdk-17-jdk openjdk-21-jdk \
+            gh chromium-browser
+
+          # Node.js LTS + npm (Ubuntu package may be older, still usable)
+          sudo apt-get install -y nodejs npm
+          sudo npm install -g pnpm typescript ts-node
+
+          # Android SDK command-line tools: install sdkmanager BEFORE invoking it
+          export ANDROID_HOME="$HOME/Android/Sdk"
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          cd /tmp
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip \
+            -O android-tools.zip
+          unzip -q android-tools.zip
+          mkdir -p "$ANDROID_HOME/cmdline-tools/latest"
+          mv cmdline-tools/* "$ANDROID_HOME/cmdline-tools/latest/"
+
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+
+          test -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | sdkmanager --sdk_root="$ANDROID_HOME" --licenses
+          sdkmanager --sdk_root="$ANDROID_HOME" \
+            "platform-tools" "platforms;android-35" \
+            "build-tools;35.0.0" "cmdline-tools;latest" "emulator"
+
+          # Android Studio GUI IDE
+          wget -q https://redirector.gvt1.com/edgedl/android/studio/ide-zips/latest/android-studio-linux.tar.gz \
+            -O /tmp/android-studio.tar.gz
+          sudo tar -xzf /tmp/android-studio.tar.gz -C /opt
+          sudo ln -sf /opt/android-studio/bin/studio /usr/local/bin/android-studio
+
+          # VS Code desktop
+          wget -q https://update.code.visualstudio.com/latest/linux-deb-x64/stable -O /tmp/code.deb
+          sudo apt-get install -y /tmp/code.deb
+
+          # OpenCode CLI
+          curl -fsSL https://opencode.ai/install | bash
+
+          # Claude Code CLI
+          curl -fsSL https://claude.ai/install.sh | bash
+
+          # Antigravity CLI: install/authenticate separately if official installer is available
+          # (interactive Google sign-in cannot be completed unattended in Actions)
+
+      - name: Configure SSH key authentication
+        shell: bash
+        env:
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+        run: |
+          set -eux
+          test -n "$SSH_PUBLIC_KEY"
+          sudo mkdir -p /home/runner/.ssh
+          printf '%s\n' "$SSH_PUBLIC_KEY" | sudo tee /home/runner/.ssh/authorized_keys >/dev/null
+          sudo chmod 700 /home/runner/.ssh
+          sudo chmod 600 /home/runner/.ssh/authorized_keys
+          sudo chown -R runner:runner /home/runner/.ssh
+
+          sudo mkdir -p /run/sshd
+          sudo sed -i \
+            -e 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' \
+            -e 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' \
+            /etc/ssh/sshd_config
+          sudo systemctl restart ssh
+
+      - name: Connect Tailscale
+        shell: bash
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          set -eux
+          test -n "$TS_AUTHKEY"
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --authkey="$TS_AUTHKEY" --hostname="kali1-${GITHUB_RUN_ID}"
+          TS_IP="$(sudo tailscale ip -4 | head -n1)"
+          echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
+
+      - name: Keep runner alive and show SSH details
+        shell: bash
+        run: |
+          echo "SSH host: $TAILSCALE_IP"
+          echo "SSH user: runner"
+          echo "Connect from Termux: ssh -i ~/.ssh/kali1 runner@$TAILSCALE_IP"
+          while true; do
+            echo "Kali1 Developer Studio runner active: $(date)"
+            sleep 300
+          done
