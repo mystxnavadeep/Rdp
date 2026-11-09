@@ -119,8 +119,16 @@ jobs:
 
           docker exec -e USER_KEY="$USER_KEY" -i kali bash << 'EOF'
           set -e
-          # Create user kali if not existing
-          id -u kali &>/dev/null || useradd -m -s /bin/bash -G sudo,adm,netdev,audio,video kali
+          # Create user kali safely without assuming group existence
+          if ! id -u kali &>/dev/null; then
+            useradd -m -s /bin/bash kali
+          fi
+
+          # Add to sudo and auxiliary groups safely
+          usermod -aG sudo kali 2>/dev/null || true
+          usermod -aG adm kali 2>/dev/null || true
+          usermod -aG audio kali 2>/dev/null || true
+          usermod -aG video kali 2>/dev/null || true
 
           # Fixed password: kali
           echo "kali:kali" | chpasswd
@@ -158,19 +166,17 @@ jobs:
       - name: Launch Lightning-Style SSH & Termux Session
         run: |
           echo "Starting tmate session inside Kali container for direct Termux SSH..."
-          # Start tmate as user kali inside Kali container
-          docker exec -d -u kali kali tmate -S /tmp/tmate.sock -F
+          docker exec -d -u kali kali tmate -S /tmp/tmate.sock new-session -d -s kali-cloud || true
 
-          # Wait for tmate to connect
           for i in $(seq 1 15); do
-            if docker exec -u kali kali tmate -S /tmp/tmate.sock wait-for-ready 2>/dev/null; then
+            if docker exec -u kali kali tmate -S /tmp/tmate.sock wait tmate-ready 2>/dev/null; then
               break
             fi
             sleep 2
           done
 
-          TMATE_SSH=$(docker exec -u kali kali tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}')
-          TMATE_WEB=$(docker exec -u kali kali tmate -S /tmp/tmate.sock display -p '#{tmate_web}')
+          TMATE_SSH=$(docker exec -u kali kali tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}' 2>/dev/null || true)
+          TMATE_WEB=$(docker exec -u kali kali tmate -S /tmp/tmate.sock display -p '#{tmate_web}' 2>/dev/null || true)
 
           echo "=========================================================="
           echo "        KALI LINUX IS READY! (SSH & RDP DETAILS)"
@@ -180,12 +186,14 @@ jobs:
           echo "Root Password: kali"
           echo "Google Chrome: Installed (/opt/google/chrome/google-chrome)"
           echo ""
-          echo "--- METHOD 1: DIRECT TERMUX SSH (Lightning.ai style, No VPN required) ---"
-          echo "Paste this directly into Termux:"
-          echo "$TMATE_SSH"
-          echo ""
-          echo "Web Browser Terminal: $TMATE_WEB"
-          echo ""
+          if [ -n "$TMATE_SSH" ]; then
+            echo "--- METHOD 1: DIRECT TERMUX SSH (Lightning.ai style, No VPN required) ---"
+            echo "Paste this directly into Termux:"
+            echo "$TMATE_SSH"
+            echo ""
+            echo "Web Browser Terminal: $TMATE_WEB"
+            echo ""
+          fi
           if [ -n "$TAILSCALE_IP" ]; then
             echo "--- METHOD 2: TAILSCALE SSH & RDP ---"
             echo "SSH Command: ssh kali@$TAILSCALE_IP"
@@ -204,12 +212,14 @@ jobs:
             echo "| **Root Password** | \`kali\` |"
             echo "| **Chrome** | Installed & Desktop shortcut ready |"
             echo ""
-            echo "### 📱 Direct Termux SSH (Copy & Paste to Termux)"
-            echo "\`\`\`bash"
-            echo "$TMATE_SSH"
-            echo "\`\`\`"
-            echo ""
-            echo "🌐 **Web Terminal:** [Open in Browser]($TMATE_WEB)"
+            if [ -n "$TMATE_SSH" ]; then
+              echo "### 📱 Direct Termux SSH (Copy & Paste to Termux)"
+              echo "\`\`\`bash"
+              echo "$TMATE_SSH"
+              echo "\`\`\`"
+              echo ""
+              echo "🌐 **Web Terminal:** [Open in Browser]($TMATE_WEB)"
+            fi
             if [ -n "$TAILSCALE_IP" ]; then
               echo ""
               echo "### 🔒 Tailscale (Private)"
