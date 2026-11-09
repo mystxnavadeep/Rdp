@@ -1,0 +1,226 @@
+name: Kali Linux Cloud (SSH + Chrome + RDP)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ssh_public_key:
+        description: 'Termux SSH Public Key (cat ~/.ssh/id_ed25519.pub)'
+        required: false
+        type: string
+
+jobs:
+  kali-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Optimize Disk Space & Stop Host SSH
+        run: |
+          echo "Preparing runner host..."
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          # Free host port 22 for Kali OpenSSH
+          sudo systemctl stop ssh.service ssh.socket || true
+          sudo systemctl disable ssh.service ssh.socket || true
+
+      - name: Connect Tailscale (Optional)
+        env:
+          TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          if [ -n "$TS_AUTH_KEY" ]; then
+            echo "Installing and connecting Tailscale..."
+            curl -fsSL https://tailscale.com/install.sh | sh
+            sudo tailscale up --authkey="$TS_AUTH_KEY" --hostname="kali-${GITHUB_RUN_ID}"
+            TS_IP=""
+            for i in $(seq 1 10); do
+              TS_IP=$(tailscale ip -4 || true)
+              if [ -n "$TS_IP" ]; then break; fi
+              sleep 3
+            done
+            if [ -n "$TS_IP" ]; then
+              echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+              echo "Tailscale IP: $TS_IP"
+            fi
+          else
+            echo "TAILSCALE_AUTH_KEY secret is not set (will rely on direct tmate SSH tunnel)."
+          fi
+
+      - name: Launch Kali Linux Container
+        run: |
+          echo "Pulling official Kali Linux rolling image..."
+          docker pull kalilinux/kali-rolling:latest
+          docker run -d \
+            --name kali \
+            --hostname kali \
+            --network host \
+            --privileged \
+            --shm-size=2g \
+            kalilinux/kali-rolling:latest tail -f /dev/null
+
+      - name: Fast Setup Kali Packages, Tools, Desktop & Google Chrome
+        run: |
+          echo "Setting up Kali Linux environment (< 4 minutes)..."
+          docker exec -i kali bash << 'EOF'
+          set -e
+          export DEBIAN_FRONTEND=noninteractive
+
+          # Speed up dpkg / apt significantly
+          mkdir -p /etc/dpkg/dpkg.cfg.d
+          echo 'force-unsafe-io' > /etc/dpkg/dpkg.cfg.d/force-unsafe-io
+          cat << 'NODOC' > /etc/dpkg/dpkg.cfg.d/01_nodoc
+          path-exclude=/usr/share/man/*
+          path-exclude=/usr/share/doc/*
+          path-exclude=/usr/share/info/*
+          NODOC
+
+          apt-get update -y
+
+          # Install Core tools, OpenSSH, XRDP, XFCE desktop, tmate, and essential pentesting tools
+          apt-get install -y --no-install-recommends \
+            sudo openssh-server curl wget git net-tools iproute2 procps \
+            nano vim unzip dbus-x11 xfce4 xfce4-terminal xrdp xorg \
+            tmate nmap sqlmap metasploit-framework hydra wireshark-common \
+            aircrack-ng john nikto python3 python3-pip
+
+          # Download and install Google Chrome
+          echo "Installing Google Chrome..."
+          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -O /tmp/chrome.deb
+          apt-get install -y /tmp/chrome.deb || apt-get install -f -y
+          rm -f /tmp/chrome.deb
+
+          # Enable --no-sandbox flag for Chrome in container & XRDP
+          if [ -f /opt/google/chrome/google-chrome ]; then
+            sed -i 's|exec -a "$0" "$HERE/chrome" "$@"|exec -a "$0" "$HERE/chrome" --no-sandbox --disable-dev-shm-usage "$@"|g' /opt/google/chrome/google-chrome
+          fi
+
+          # Create desktop shortcut for Chrome
+          mkdir -p /etc/skel/Desktop
+          cat << 'DESKTOP' > /etc/skel/Desktop/google-chrome.desktop
+          [Desktop Entry]
+          Version=1.0
+          Name=Google Chrome
+          GenericName=Web Browser
+          Exec=/opt/google/chrome/google-chrome --no-sandbox --disable-dev-shm-usage %U
+          StartupNotify=true
+          Terminal=false
+          Icon=google-chrome
+          Type=Application
+          Categories=Network;WebBrowser;
+          DESKTOP
+          chmod +x /etc/skel/Desktop/google-chrome.desktop
+
+          EOF
+
+      - name: Configure Kali User, Sudo, XRDP & SSH Keys
+        env:
+          INPUT_SSH_KEY: ${{ github.event.inputs.ssh_public_key }}
+          SECRET_SSH_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+        run: |
+          USER_KEY="${INPUT_SSH_KEY:-$SECRET_SSH_KEY}"
+
+          docker exec -e USER_KEY="$USER_KEY" -i kali bash << 'EOF'
+          set -e
+          # Create user kali if not existing
+          id -u kali &>/dev/null || useradd -m -s /bin/bash -G sudo,adm,netdev,audio,video kali
+
+          # Fixed password: kali
+          echo "kali:kali" | chpasswd
+          echo "root:kali" | chpasswd
+
+          # Passwordless sudo for kali
+          echo "kali ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/kali
+          chmod 0440 /etc/sudoers.d/kali
+
+          # Configure OpenSSH
+          mkdir -p /var/run/sshd /home/kali/.ssh /root/.ssh
+          sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+          sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+
+          # Add user SSH key if provided (Lightning.ai style)
+          if [ -n "$USER_KEY" ]; then
+            echo "$USER_KEY" >> /home/kali/.ssh/authorized_keys
+            echo "$USER_KEY" >> /root/.ssh/authorized_keys
+            chmod 700 /home/kali/.ssh /root/.ssh
+            chmod 600 /home/kali/.ssh/authorized_keys /root/.ssh/authorized_keys
+          fi
+
+          # Copy Desktop shortcut to kali user
+          mkdir -p /home/kali/Desktop
+          cp -r /etc/skel/Desktop/* /home/kali/Desktop/ 2>/dev/null || true
+          echo "startxfce4" > /home/kali/.xsession
+          chown -R kali:kali /home/kali
+
+          # Start SSH and XRDP
+          service ssh restart
+          service xrdp restart
+          EOF
+
+      - name: Launch Lightning-Style SSH & Termux Session
+        run: |
+          echo "Starting tmate session inside Kali container for direct Termux SSH..."
+          # Start tmate as user kali inside Kali container
+          docker exec -d -u kali kali tmate -S /tmp/tmate.sock -F
+
+          # Wait for tmate to connect
+          for i in $(seq 1 15); do
+            if docker exec -u kali kali tmate -S /tmp/tmate.sock wait-for-ready 2>/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+
+          TMATE_SSH=$(docker exec -u kali kali tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}')
+          TMATE_WEB=$(docker exec -u kali kali tmate -S /tmp/tmate.sock display -p '#{tmate_web}')
+
+          echo "=========================================================="
+          echo "        KALI LINUX IS READY! (SSH & RDP DETAILS)"
+          echo "=========================================================="
+          echo "User: kali"
+          echo "Password: kali"
+          echo "Root Password: kali"
+          echo "Google Chrome: Installed (/opt/google/chrome/google-chrome)"
+          echo ""
+          echo "--- METHOD 1: DIRECT TERMUX SSH (Lightning.ai style, No VPN required) ---"
+          echo "Paste this directly into Termux:"
+          echo "$TMATE_SSH"
+          echo ""
+          echo "Web Browser Terminal: $TMATE_WEB"
+          echo ""
+          if [ -n "$TAILSCALE_IP" ]; then
+            echo "--- METHOD 2: TAILSCALE SSH & RDP ---"
+            echo "SSH Command: ssh kali@$TAILSCALE_IP"
+            echo "RDP GUI (Chrome Desktop): $TAILSCALE_IP:3389"
+          fi
+          echo "=========================================================="
+
+          # Also write to GitHub Step Summary
+          {
+            echo "## ⚡ Kali Linux Cloud Instance"
+            echo ""
+            echo "| Item | Details |"
+            echo "| --- | --- |"
+            echo "| **Username** | \`kali\` |"
+            echo "| **Password** | \`kali\` |"
+            echo "| **Root Password** | \`kali\` |"
+            echo "| **Chrome** | Installed & Desktop shortcut ready |"
+            echo ""
+            echo "### 📱 Direct Termux SSH (Copy & Paste to Termux)"
+            echo "\`\`\`bash"
+            echo "$TMATE_SSH"
+            echo "\`\`\`"
+            echo ""
+            echo "🌐 **Web Terminal:** [Open in Browser]($TMATE_WEB)"
+            if [ -n "$TAILSCALE_IP" ]; then
+              echo ""
+              echo "### 🔒 Tailscale (Private)"
+              echo "- **SSH:** \`ssh kali@$TAILSCALE_IP\`"
+              echo "- **RDP:** \`$TAILSCALE_IP:3389\`"
+            fi
+          } >> $GITHUB_STEP_SUMMARY
+
+          # Keep runner alive
+          echo "Session active. Press Cancel workflow when done."
+          while true; do
+            echo "[$(date)] Kali Cloud is active (User: kali | Pass: kali)"
+            sleep 300
+          done
