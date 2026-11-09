@@ -64,7 +64,7 @@ jobs:
           export DEBIAN_FRONTEND=noninteractive
 
           # Speed up dpkg / apt significantly
-          mkdir -p /etc/dpkg/dpkg.cfg.d
+          mkdir -p /etc/dpkg/dpkg.cfg.d /etc/apt/apt.conf.d
           echo 'force-unsafe-io' > /etc/dpkg/dpkg.cfg.d/force-unsafe-io
           cat << 'NODOC' > /etc/dpkg/dpkg.cfg.d/01_nodoc
           path-exclude=/usr/share/man/*
@@ -72,10 +72,14 @@ jobs:
           path-exclude=/usr/share/info/*
           NODOC
 
+          # Force IPv4 for apt to prevent mirror 'Network is unreachable' on Azure/GitHub runners
+          echo 'Acquire::ForceIPv4 "true";' > /etc/apt/apt.conf.d/99force-ipv4
+          echo 'Acquire::Retries "5";' >> /etc/apt/apt.conf.d/99force-ipv4
+
           apt-get update -y
 
           # Install Core tools, OpenSSH, XRDP, Xorg-XRDP driver, TigerVNC fallback, XFCE desktop, tmate, and pentesting tools
-          apt-get install -y --no-install-recommends \
+          apt-get install -y --fix-missing --no-install-recommends \
             sudo openssh-server curl wget git net-tools iproute2 procps \
             nano vim unzip dbus-x11 xfce4 xfce4-terminal xrdp xorg \
             xorgxrdp tigervnc-standalone-server \
