@@ -74,10 +74,11 @@ jobs:
 
           apt-get update -y
 
-          # Install Core tools, OpenSSH, XRDP, XFCE desktop, tmate, and essential pentesting tools
+          # Install Core tools, OpenSSH, XRDP, Xorg-XRDP driver, TigerVNC fallback, XFCE desktop, tmate, and pentesting tools
           apt-get install -y --no-install-recommends \
             sudo openssh-server curl wget git net-tools iproute2 procps \
             nano vim unzip dbus-x11 xfce4 xfce4-terminal xrdp xorg \
+            xorgxrdp tigervnc-standalone-server \
             tmate nmap sqlmap metasploit-framework hydra wireshark-common \
             aircrack-ng john nikto python3 python3-pip
 
@@ -110,7 +111,7 @@ jobs:
 
           EOF
 
-      - name: Configure Kali User, Sudo, XRDP & SSH Keys
+      - name: Configure Kali User, Sudo, XRDP Session & SSH Keys
         env:
           INPUT_SSH_KEY: ${{ github.event.inputs.ssh_public_key }}
           SECRET_SSH_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
@@ -119,32 +120,70 @@ jobs:
 
           docker exec -e USER_KEY="$USER_KEY" -i kali bash << 'EOF'
           set -e
-          # Create user kali safely without assuming group existence
+
+          # 1. Create user kali safely without assuming group existence
           if ! id -u kali &>/dev/null; then
             useradd -m -s /bin/bash kali
           fi
 
-          # Add to sudo and auxiliary groups safely
+          # 2. Add to sudo and auxiliary groups safely
           usermod -aG sudo kali 2>/dev/null || true
           usermod -aG adm kali 2>/dev/null || true
           usermod -aG audio kali 2>/dev/null || true
           usermod -aG video kali 2>/dev/null || true
 
-          # Fixed password: kali
+          # 3. Fixed password: kali
           echo "kali:kali" | chpasswd
           echo "root:kali" | chpasswd
 
-          # Passwordless sudo for kali
+          # 4. Passwordless sudo for kali
           echo "kali ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/kali
           chmod 0440 /etc/sudoers.d/kali
 
-          # Configure OpenSSH
+          # 5. Fix Xwrapper: Allow non-console users to start Xorg
+          mkdir -p /etc/X11
+          cat << 'XWRAPPER' > /etc/X11/Xwrapper.config
+          allowed_users=anybody
+          needs_root_rights=no
+          XWRAPPER
+
+          # 6. Fix XRDP Session Startup: startwm.sh with clean D-Bus session
+          cat << 'STARTWM' > /etc/xrdp/startwm.sh
+          #!/bin/sh
+          if [ -r /etc/default/locale ]; then
+            . /etc/default/locale
+            export LANG LANGUAGE
+          fi
+
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset XDG_RUNTIME_DIR
+
+          exec dbus-run-session -- startxfce4
+          STARTWM
+          chmod +x /etc/xrdp/startwm.sh
+
+          # 7. User session and environment scripts
+          cat << 'XSESSION' > /home/kali/.xsession
+          #!/bin/sh
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset XDG_RUNTIME_DIR
+          exec dbus-run-session -- startxfce4
+          XSESSION
+          chmod +x /home/kali/.xsession
+
+          cat << 'XSESSIONRC' > /home/kali/.xsessionrc
+          export XDG_SESSION_TYPE=x11
+          export XDG_CURRENT_DESKTOP=XFCE
+          export XDG_CONFIG_DIRS=/etc/xdg
+          XSESSIONRC
+
+          # 8. Configure OpenSSH
           mkdir -p /var/run/sshd /home/kali/.ssh /root/.ssh
           sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
           sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
           sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
 
-          # Add user SSH key if provided (Lightning.ai style)
+          # 9. Add user SSH key if provided (Lightning.ai style)
           if [ -n "$USER_KEY" ]; then
             echo "$USER_KEY" >> /home/kali/.ssh/authorized_keys
             echo "$USER_KEY" >> /root/.ssh/authorized_keys
@@ -152,13 +191,23 @@ jobs:
             chmod 600 /home/kali/.ssh/authorized_keys /root/.ssh/authorized_keys
           fi
 
-          # Copy Desktop shortcut to kali user
+          # 10. Copy Desktop shortcut to kali user
           mkdir -p /home/kali/Desktop
           cp -r /etc/skel/Desktop/* /home/kali/Desktop/ 2>/dev/null || true
-          echo "startxfce4" > /home/kali/.xsession
           chown -R kali:kali /home/kali
 
-          # Start SSH and XRDP
+          # 11. Prepare X11 & XRDP runtime directories and permissions
+          mkdir -p /tmp/.X11-unix /tmp/.xrdp /run/user/1000
+          chmod 1777 /tmp/.X11-unix /tmp/.xrdp
+          chown root:root /tmp/.X11-unix /tmp/.xrdp
+          chown -R kali:kali /run/user/1000 2>/dev/null || true
+          chmod 700 /run/user/1000 2>/dev/null || true
+
+          adduser xrdp ssl-cert 2>/dev/null || true
+          adduser kali ssl-cert 2>/dev/null || true
+
+          # 12. Start D-Bus daemon first, then OpenSSH and XRDP
+          service dbus start || /etc/init.d/dbus start || true
           service ssh restart
           service xrdp restart
           EOF
